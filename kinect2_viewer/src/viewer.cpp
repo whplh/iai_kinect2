@@ -68,6 +68,8 @@ private:
 
   bool updateImage, updateCloud;
   bool save;
+  bool collect;
+  int collCount;
   bool running;
   size_t frame;
   const size_t queueSize;
@@ -91,6 +93,7 @@ private:
   std::thread imageViewerThread;
   Mode mode;
 
+  std::vector<pcl::PointCloud<pcl::PointXYZRGBA> > coll_cloud;
   pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cloud;
   pcl::PCDWriter writer;
   std::ostringstream oss;
@@ -99,7 +102,7 @@ private:
 public:
   Receiver(const std::string &topicColor, const std::string &topicDepth, const bool useExact, const bool useCompressed)
     : topicColor(topicColor), topicDepth(topicDepth), useExact(useExact), useCompressed(useCompressed),
-      updateImage(false), updateCloud(false), save(false), running(false), frame(0), queueSize(5),
+      updateImage(false), updateCloud(false), save(false),collect(false),collCount(60), running(false), frame(0), queueSize(5),
       nh("~"), spinner(0), it(nh), mode(CLOUD)
   {
     cameraMatrixColor = cv::Mat::zeros(3, 3, CV_64F);
@@ -109,7 +112,7 @@ public:
     params.push_back(cv::IMWRITE_PNG_COMPRESSION);
     params.push_back(1);
     params.push_back(cv::IMWRITE_PNG_STRATEGY);
-    params.push_back(cv::IMWRITE_PNG_STRATEGY_RLE);
+    params.push_back(cv::ImwritePNGFlags::IMWRITE_PNG_STRATEGY_RLE);
     params.push_back(0);
   }
 
@@ -167,6 +170,7 @@ private:
     cloud->points.resize(cloud->height * cloud->width);
     createLookup(this->color.cols, this->color.rows);
 
+    coll_cloud.resize(collCount,*cloud);
     switch(mode)
     {
     case CLOUD:
@@ -222,7 +226,7 @@ private:
     {
       cv::Mat tmp;
       color.convertTo(tmp, CV_8U, 0.02);
-      cv::cvtColor(tmp, color, CV_GRAY2BGR);
+      cv::cvtColor(tmp, color, cv::ColorConversionCodes::COLOR_GRAY2BGR);
     }
 
     lock.lock();
@@ -276,7 +280,7 @@ private:
         combine(color, depthDisp, combined);
         //combined = color;
 
-        cv::putText(combined, oss.str(), pos, font, sizeText, colorText, lineText, CV_AA);
+        cv::putText(combined, oss.str(), pos, font, sizeText, colorText, lineText,  cv::LineTypes::LINE_AA);
         cv::imshow("Image Viewer", combined);
       }
 
@@ -350,6 +354,18 @@ private:
         dispDepth(depth, depthDisp, 12000.0f);
         saveCloudAndImages(cloud, color, depth, depthDisp);
       }
+      if (collect && collCount>0){
+          OUT_INFO("Copy count " << collCount);
+          pcl::copyPointCloud(*cloud,coll_cloud[coll_cloud.size()-collCount]);
+          collCount-=1;
+      }
+      else if(collect && collCount<=0){
+                    collect=false;
+                    collCount=coll_cloud.size();
+                    OUT_INFO("Getting mean");
+                    meanCloud(coll_cloud);
+                    saveCloud("test.pcd",coll_cloud[0]);
+      }
       visualizer->spinOnce(10);
     }
     visualizer->close();
@@ -369,6 +385,9 @@ private:
       case 's':
         save = true;
         break;
+      case 'c':  //Collect cloud images and average the depth values then save
+        collect=true;
+          break;
       }
     }
   }
@@ -464,7 +483,33 @@ private:
       }
     }
   }
+ template <typename T>
+ void meanCloud(T v_cloud){
+     #pragma omp parallel for
+     for(int r = 0; r < v_cloud[0].height; ++r)
+     {
+       std::vector<pcl::PointXYZRGBA *> vp_Cloud(collCount);
+       for (int i=0;i<v_cloud.size();i++){
+           vp_Cloud[i]=&v_cloud[i].points[r * v_cloud[0].width];
+       }
 
+       for(size_t c = 0; c < (size_t)v_cloud[0].width;c++)
+       {
+           for (int i=1;i<v_cloud.size();i++){
+               vp_Cloud[0]->x+=vp_Cloud[i]->x;
+               vp_Cloud[0]->y+=vp_Cloud[i]->y;
+               vp_Cloud[0]->z+=vp_Cloud[i]->z;
+           }
+           vp_Cloud[0]->x/=v_cloud.size();
+           vp_Cloud[0]->y/=v_cloud.size();
+           vp_Cloud[0]->z/=v_cloud.size();
+           for (int i=0;i<v_cloud.size();i++){
+               vp_Cloud[i]++;
+           }
+
+       }
+     }
+ }
   void saveCloudAndImages(const pcl::PointCloud<pcl::PointXYZRGBA>::ConstPtr cloud, const cv::Mat &color, const cv::Mat &depth, const cv::Mat &depthColored)
   {
     oss.str("");
@@ -475,8 +520,7 @@ private:
     const std::string depthName = baseName + "_depth.png";
     const std::string depthColoredName = baseName + "_depth_colored.png";
 
-    OUT_INFO("saving cloud: " << cloudName);
-    writer.writeBinary(cloudName, *cloud);
+    saveCloud(cloudName,*cloud);
     OUT_INFO("saving color: " << colorName);
     cv::imwrite(colorName, color, params);
     OUT_INFO("saving depth: " << depthName);
@@ -487,6 +531,10 @@ private:
     ++frame;
   }
 
+  void saveCloud(const std::string& cloudName,const pcl::PointCloud<pcl::PointXYZRGBA>& cloud){
+      OUT_INFO("saving cloud: " << cloudName);
+      writer.writeBinary(cloudName, cloud);
+  }
   void createLookup(size_t width, size_t height)
   {
     const float fx = 1.0f / cameraMatrixColor.at<double>(0, 0);
